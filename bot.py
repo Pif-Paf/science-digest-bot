@@ -3,7 +3,7 @@
 Science Digest Bot (OpenRouter Edition) — ежедневный дайджест по ИБ, ML и AI.
 
 Полностью бесплатный стек:
-- Сбор: arXiv, Reddit, Hacker News (открытые API)
+- Сбор: arXiv, Hacker News (открытые API, без ключей)
 - Анализ: OpenRouter free-модели (DeepSeek V3, Llama 3.3 70B и др.) с fallback-цепочкой
 - Озвучка: edge-tts (Microsoft, бесплатно)
 - Доставка: Telegram (текст + голосовое сообщение)
@@ -52,7 +52,7 @@ MODEL_FALLBACK_CHAIN = [
     "nvidia/nemotron-3-ultra-550b-a55b:free", # NVIDIA Nemotron 3 Ultra 550B, 1M контекст
     "poolside/laguna-m.1:free",               # Poolside Laguna M.1
     "openai/gpt-oss-120b:free",               # OpenAI GPT-OSS 120B
-    "openrouter/owl-alpha",                   # Owl Alpha (бесплатна, слаг без :free)
+    "openrouter/owl-alpha",                   # Owl Alpha 
     "openrouter/free",                        # страховка: авто-выбор любой доступной free-модели
 ]
 
@@ -75,28 +75,41 @@ def fetch_arxiv_papers(categories: List[str], max_results: int = 5) -> List[Dict
     - cs.AI  — Artificial Intelligence
     """
     papers = []
-    base_url = "http://export.arxiv.org/api/query"
+    base_url = "https://export.arxiv.org/api/query"
+    # Граница свежести: статьи за последние ~2 суток (с запасом, т.к. arXiv
+    # обновляется пачками и узкое окно может давать пустой результат)
+    cutoff = datetime.utcnow() - timedelta(days=2)
 
     for category in categories:
-        # Окно последних суток
-        date_from = (datetime.utcnow() - timedelta(days=1)).strftime("%Y%m%d%H%M%S")
-        date_to = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        query = f"cat:{category} AND submittedDate:[{date_from}Z TO {date_to}Z]"
-
+        # ВАЖНО: фильтр submittedDate:[...] в search_query у arXiv нестабилен
+        # и часто отдаёт HTTP 500. Поэтому НЕ фильтруем по дате в запросе, а
+        # берём самые свежие статьи сортировкой и отсекаем старые уже у себя.
         params = {
-            "search_query": query,
+            "search_query": f"cat:{category}",
             "sortBy": "submittedDate",
             "sortOrder": "descending",
-            "max_results": max_results,
+            "max_results": max_results * 2,  # берём с запасом под фильтрацию по дате
             "start": 0,
         }
 
         try:
-            response = requests.get(base_url, params=params, timeout=15)
+            headers = {"User-Agent": "Science-Digest-Bot/2.0 (personal research use)"}
+            response = requests.get(base_url, params=params, headers=headers, timeout=20)
             response.raise_for_status()
             feed = feedparser.parse(response.content)
 
-            for entry in feed.entries[:max_results]:
+            added = 0
+            for entry in feed.entries:
+                if added >= max_results:
+                    break
+                # Отсекаем старые статьи (если дата распознаётся)
+                try:
+                    pub = datetime(*entry.published_parsed[:6])
+                    if pub < cutoff:
+                        continue
+                except Exception:
+                    pass  # если дату не распознали — оставляем статью
+
                 papers.append({
                     "source": "arXiv",
                     "title": entry.title.replace("\n", " ").strip(),
@@ -106,8 +119,9 @@ def fetch_arxiv_papers(categories: List[str], max_results: int = 5) -> List[Dict
                     "published": getattr(entry, "published", ""),
                     "category": category,
                 })
+                added += 1
             # Лёгкая пауза, чтобы не упереться в rate limit arXiv
-            time.sleep(1)
+            time.sleep(3)  # arXiv просит не чаще 1 запроса в 3 сек
         except Exception as e:
             print(f"[arXiv:{category}] ошибка: {e}", file=sys.stderr)
 
@@ -115,94 +129,54 @@ def fetch_arxiv_papers(categories: List[str], max_results: int = 5) -> List[Dict
 
 
 # ============================================================================
-# БЛОК 2: СБОР ПОСТОВ ИЗ REDDIT (публичный JSON, без аутентификации)
+# БЛОК 2: СБОР ИСТОРИЙ И КОММЕНТАРИЕВ ИЗ HACKER NEWS
 # ============================================================================
 
-def fetch_reddit_posts(subreddits: List[str], max_posts: int = 3) -> List[Dict]:
+def fetch_hackernews_comments(story_id: int, max_comments: int = 4) -> List[str]:
     """
-    Собирает горячие посты из указанных сабреддитов через публичный JSON-эндпойнт.
-    Без ключей и без PRAW.
-    """
-    posts = []
-    headers = {"User-Agent": "Science-Digest-Bot/2.0 (personal use)"}
-
-    for subreddit in subreddits:
-        try:
-            url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=10"
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-
-            count = 0
-            for post in data["data"]["children"]:
-                if count >= max_posts:
-                    break
-                p = post["data"]
-
-                # Пропускаем закреплённые/удалённые
-                if p.get("stickied") or p.get("author") == "[deleted]":
-                    continue
-
-                posts.append({
-                    "source": f"Reddit r/{subreddit}",
-                    "title": p.get("title", ""),
-                    "author": p.get("author", ""),
-                    "text": (p.get("selftext", "") or "")[:400],
-                    "url": f"https://reddit.com{p.get('permalink', '')}",
-                    "score": p.get("score", 0),
-                    "num_comments": p.get("num_comments", 0),
-                })
-                count += 1
-            time.sleep(1)
-        except Exception as e:
-            print(f"[Reddit:{subreddit}] ошибка: {e}", file=sys.stderr)
-
-    return posts
-
-
-# ============================================================================
-# БЛОК 3: СБОР ТОПОВЫХ КОММЕНТАРИЕВ К REDDIT-ПОСТАМ (для анализа обсуждений)
-# ============================================================================
-
-def fetch_reddit_top_comments(post_url: str, max_comments: int = 4) -> List[str]:
-    """
-    Подтягивает топовые комментарии к конкретному посту Reddit через .json.
-    Возвращает список текстов комментариев (для последующего анализа моделью).
+    Собирает несколько верхних комментариев к истории Hacker News.
+    HN отдаёт ID комментариев в поле 'kids'; берём первые (они отсортированы
+    по рейтингу) и тянем их текст. Возвращает список текстов комментариев.
     """
     comments = []
-    headers = {"User-Agent": "Science-Digest-Bot/2.0 (personal use)"}
-
     try:
-        json_url = post_url.rstrip("/") + ".json?limit=10&sort=top"
-        response = requests.get(json_url, headers=headers, timeout=15)
-        response.raise_for_status()
-        data = response.json()
+        item_url = f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json"
+        resp = requests.get(item_url, timeout=10)
+        resp.raise_for_status()
+        story = resp.json()
 
-        # data[1] — это дерево комментариев
-        if len(data) > 1:
-            for child in data[1]["data"]["children"][:max_comments + 2]:
-                if child.get("kind") != "t1":
+        kid_ids = story.get("kids", [])[:max_comments + 3]
+        for kid_id in kid_ids:
+            if len(comments) >= max_comments:
+                break
+            try:
+                c_url = f"https://hacker-news.firebaseio.com/v0/item/{kid_id}.json"
+                c_resp = requests.get(c_url, timeout=10)
+                c_resp.raise_for_status()
+                comment = c_resp.json()
+                if comment.get("deleted") or comment.get("dead"):
                     continue
-                body = child["data"].get("body", "")
-                if body and body not in ("[deleted]", "[removed]"):
-                    comments.append(body[:300])
-                if len(comments) >= max_comments:
-                    break
-        time.sleep(1)
+                text = comment.get("text", "")
+                if text:
+                    # HN хранит комментарии в HTML — грубо чистим теги
+                    import re
+                    clean = re.sub(r"<[^>]+>", " ", text)
+                    clean = clean.replace("&#x27;", "'").replace("&quot;", '"')
+                    clean = clean.replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
+                    comments.append(clean.strip()[:300])
+            except Exception:
+                continue
     except Exception as e:
-        print(f"[Reddit comments] ошибка для {post_url}: {e}", file=sys.stderr)
+        print(f"[HN comments] ошибка для {story_id}: {e}", file=sys.stderr)
 
     return comments
 
 
-# ============================================================================
-# БЛОК 4: СБОР ИСТОРИЙ ИЗ HACKER NEWS
-# ============================================================================
-
-def fetch_hackernews_stories(max_stories: int = 5) -> List[Dict]:
+def fetch_hackernews_stories(max_stories: int = 5, with_comments: bool = True) -> List[Dict]:
     """
     Собирает топовые истории Hacker News, фильтруя по ключевым словам тематики.
-    Официальный API, полностью бесплатный.
+    Официальный API, полностью бесплатный. Опционально подтягивает комментарии
+    к самым обсуждаемым историям (для анализа реакции сообщества).
     """
     stories = []
     keywords = [
@@ -236,9 +210,24 @@ def fetch_hackernews_stories(max_stories: int = 5) -> List[Dict]:
                         "url": story.get("url", f"https://news.ycombinator.com/item?id={story_id}"),
                         "num_comments": story.get("descendants", 0),
                         "hn_url": f"https://news.ycombinator.com/item?id={story_id}",
+                        "_story_id": story_id,
                     })
             except Exception:
                 continue
+
+        # Подтягиваем комментарии к самым обсуждаемым историям
+        if with_comments:
+            top_discussed = sorted(stories, key=lambda s: s.get("num_comments", 0), reverse=True)
+            for story in top_discussed[:3]:  # только к 3 самым обсуждаемым
+                if story.get("num_comments", 0) > 5:
+                    story["top_comments"] = fetch_hackernews_comments(
+                        story["_story_id"], max_comments=4
+                    )
+
+        # Убираем служебное поле перед передачей в модель
+        for story in stories:
+            story.pop("_story_id", None)
+
     except Exception as e:
         print(f"[Hacker News] ошибка: {e}", file=sys.stderr)
 
@@ -246,7 +235,7 @@ def fetch_hackernews_stories(max_stories: int = 5) -> List[Dict]:
 
 
 # ============================================================================
-# БЛОК 5: АНАЛИЗ ЧЕРЕЗ OPENROUTER (с fallback-цепочкой моделей)
+# БЛОК 3: АНАЛИЗ ЧЕРЕЗ OPENROUTER (с fallback-цепочкой моделей)
 # ============================================================================
 
 def call_openrouter(prompt: str, max_tokens: int = 2000) -> Optional[str]:
@@ -319,7 +308,7 @@ def analyze_materials(all_materials: List[Dict]) -> str:
 информационной безопасности, машинного обучения и искусственного интеллекта.
 
 Перед тобой материалы за последние сутки: научные статьи (arXiv) и обсуждения в \
-сообществе (Reddit, Hacker News), включая комментарии пользователей.
+сообществе (Hacker News), включая комментарии пользователей.
 
 ИСХОДНЫЕ МАТЕРИАЛЫ (в формате JSON):
 {materials_text}
@@ -374,42 +363,85 @@ def analyze_materials(all_materials: List[Dict]) -> str:
 
 
 # ============================================================================
-# БЛОК 6: ОЗВУЧКА ЧЕРЕЗ EDGE-TTS (бесплатно)
+# БЛОК 4: ОЗВУЧКА (EDGE-TTS + ЗАПАСНОЙ GTTS) (бесплатно)
 # ============================================================================
 
-async def synthesize_audio(text: str, output_file: str = "digest.mp3") -> Optional[str]:
-    """
-    Синтезирует речь из текста с помощью Microsoft Edge TTS (бесплатно, без ключей).
-    Возвращает путь к файлу или None при ошибке.
-    """
+def _prepare_tts_text(text: str) -> str:
+    """Чистит текст от разметки и эмодзи, ограничивает длину — общий для обоих движков."""
+    clean = (text
+             .replace("🔝", "").replace("📌", "").replace("**", "")
+             .replace("#", "").replace("*", "").replace("━", ""))
+    clean = clean[:TTS_MAX_CHARS]
+    intro = f"Научный дайджест за {datetime.now().strftime('%d.%m.%Y')}. "
+    return intro + clean
+
+
+async def _synthesize_edge(speech_text: str, output_file: str) -> bool:
+    """Основной движок: Microsoft Edge TTS. Возвращает True при успехе."""
     try:
         import edge_tts
     except ImportError:
-        print("   ⚠️  edge-tts не установлен (pip install edge-tts), пропускаю аудио",
-              file=sys.stderr)
-        return None
-
-    # Готовим текст для озвучки: убираем разметку, ограничиваем длину
-    clean = (text
-             .replace("🔝", "").replace("📌", "").replace("**", "")
-             .replace("#", "").replace("*", ""))
-    clean = clean[:TTS_MAX_CHARS]
-
-    intro = f"Научный дайджест за {datetime.now().strftime('%d.%m.%Y')}. "
-    speech_text = intro + clean
+        print("   ⚠️  edge-tts не установлен, пробую запасной движок", file=sys.stderr)
+        return False
 
     try:
         communicate = edge_tts.Communicate(speech_text, TTS_VOICE)
         await communicate.save(output_file)
-        print(f"   ✓ Аудио сохранено: {output_file}")
-        return output_file
+        # Проверяем, что файл не пустой (edge-tts иногда «успешно» создаёт 0 байт)
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            print(f"   ✓ Аудио (edge-tts) сохранено: {output_file}")
+            return True
+        print("   ⚠️  edge-tts вернул пустой файл", file=sys.stderr)
+        return False
     except Exception as e:
-        print(f"   ⚠️  Ошибка озвучки: {e}", file=sys.stderr)
-        return None
+        print(f"   ⚠️  edge-tts недоступен: {e}", file=sys.stderr)
+        return False
+
+
+def _synthesize_gtts(speech_text: str, output_file: str) -> bool:
+    """Запасной движок: Google TTS (gTTS). Другой сервис — не падает вместе с Edge."""
+    try:
+        from gtts import gTTS
+    except ImportError:
+        print("   ⚠️  gTTS не установлен, аудио пропущено", file=sys.stderr)
+        return False
+
+    try:
+        tts = gTTS(text=speech_text, lang="ru")
+        tts.save(output_file)
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            print(f"   ✓ Аудио (gTTS, запасной движок) сохранено: {output_file}")
+            return True
+        return False
+    except Exception as e:
+        print(f"   ⚠️  gTTS тоже недоступен: {e}", file=sys.stderr)
+        return False
+
+
+async def synthesize_audio(text: str, output_file: str = "digest.mp3") -> Optional[str]:
+    """
+    Озвучивает дайджест. Сначала пробует Microsoft Edge TTS, при сбое (например,
+    частая ошибка 403) автоматически переключается на запасной движок gTTS (Google).
+    Возвращает путь к файлу или None, если оба движка не сработали.
+    """
+    speech_text = _prepare_tts_text(text)
+
+    # 1) Основной движок — Edge TTS (качественный русский голос)
+    if await _synthesize_edge(speech_text, output_file):
+        return output_file
+
+    # 2) Запасной движок — gTTS (другой сервис, выручает при 403 от Edge)
+    print("   → переключаюсь на запасной движок gTTS...")
+    if _synthesize_gtts(speech_text, output_file):
+        return output_file
+
+    print("   ⚠️  Оба TTS-движка недоступны, дайджест отправлен только текстом",
+          file=sys.stderr)
+    return None
 
 
 # ============================================================================
-# БЛОК 7: ОТПРАВКА В TELEGRAM (текст + аудио)
+# БЛОК 5: ОТПРАВКА В TELEGRAM (текст + аудио)
 # ============================================================================
 
 def send_telegram_text(text: str) -> bool:
@@ -464,7 +496,7 @@ def send_telegram_audio(file_path: str) -> bool:
 
 
 # ============================================================================
-# БЛОК 8: ОСНОВНОЙ WORKFLOW
+# БЛОК 6: ОСНОВНОЙ WORKFLOW
 # ============================================================================
 
 def main():
@@ -473,27 +505,14 @@ def main():
 
     # --- Шаг 1: сбор материалов ---
     print("📚 arXiv...")
-    arxiv_papers = fetch_arxiv_papers(["cs.CR", "cs.LG", "cs.AI"], max_results=5)
+    arxiv_papers = fetch_arxiv_papers(["cs.CR", "cs.LG", "cs.AI"], max_results=6)
     print(f"   ✓ {len(arxiv_papers)} статей")
 
-    print("💬 Reddit...")
-    reddit_posts = fetch_reddit_posts(
-        ["MachineLearning", "netsec", "cybersecurity"], max_posts=3
-    )
-    print(f"   ✓ {len(reddit_posts)} постов")
-
-    # Подтягиваем комментарии к самым обсуждаемым постам Reddit
-    print("🗨️  Комментарии к топ-постам Reddit...")
-    reddit_sorted = sorted(reddit_posts, key=lambda p: p.get("num_comments", 0), reverse=True)
-    for post in reddit_sorted[:3]:  # только к 3 самым обсуждаемым (экономим запросы)
-        if post.get("num_comments", 0) > 5:
-            post["top_comments"] = fetch_reddit_top_comments(post["url"], max_comments=4)
-
-    print("📰 Hacker News...")
-    hn_stories = fetch_hackernews_stories(max_stories=5)
+    print("📰 Hacker News (истории + комментарии)...")
+    hn_stories = fetch_hackernews_stories(max_stories=8, with_comments=True)
     print(f"   ✓ {len(hn_stories)} историй")
 
-    all_materials = arxiv_papers + reddit_posts + hn_stories
+    all_materials = arxiv_papers + hn_stories
     print(f"\n📊 Всего материалов: {len(all_materials)}")
 
     if not all_materials:
